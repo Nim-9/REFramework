@@ -1,0 +1,38 @@
+name: GPTK PD Upscaler Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Configure CMake
+        run: >
+          cmake -S .
+          -B build
+          -G "Visual Studio 17 2022"
+          -A x64
+          -DCMAKE_BUILD_TYPE=Release
+          -DDEVELOPER_MODE=ON
+          "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+
+      - name: Build REFramework
+        run: >
+          cmake --build build
+          --config Release
+          --target REFramework
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: REFramework-PD-Upscaler-GPTK
+          path: build/bin/REFramework/dinput8.dll
+          if-no-files-found: error
