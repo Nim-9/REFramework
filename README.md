@@ -1,4 +1,4 @@
-# REFramework Upscaler — macOS / CrossOver
+# REFramework — macOS / CrossOver
 
 A modified build of [REFramework](https://github.com/praydog/REFramework) focused on bringing upscaling support to Resident Evil games running through **CrossOver / Wine on macOS**.
 
