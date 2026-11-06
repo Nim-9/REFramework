@@ -18,6 +18,10 @@
 
 #include "D3D12Hook.hpp"
 
+// Diagnostic mode: disable heuristic Wine command-queue discovery.
+// Set to 0 to restore the original GPTK implementation.
+#define REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC 1
+
 static D3D12Hook* g_d3d12_hook = nullptr;
 thread_local bool g_inside_d3d12_hook = false;
 static constexpr auto COMMAND_QUEUE_SCAN_BYTES = 512 * sizeof(void*);
@@ -203,7 +207,7 @@ HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* dev
             }
         }
 
-        if (s_command_queue_offset == 0 && wine) {
+        if (s_command_queue_offset == 0 && wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC) {
             auto refcount_probe = hold_refcount_probe(device);
             utility::ScopeGuard refcount_guard{[&]() {
                 release_refcount_probe(refcount_probe);
@@ -217,7 +221,7 @@ HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* dev
         }
 
         // Wine/D3DMetal last resort: hardcoded offset from swapchain memory dump
-        if (s_command_queue_offset == 0 && wine) {
+        if (s_command_queue_offset == 0 && wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC) {
             constexpr uint32_t WINE_D3DMETAL_CQ_OFFSET = 0x4C8;
             const auto base = (uintptr_t)*swap_chain + WINE_D3DMETAL_CQ_OFFSET;
             if (!IsBadReadPtr((void*)base, sizeof(void*))) {
@@ -301,7 +305,7 @@ void D3D12Hook::hook_streamline(HMODULE dlssg_module) try {
 }
 
 bool D3D12Hook::hook() {
-    spdlog::info("Hooking D3D12");
+    spdlog::info("Hooking D3D12 (GPTK4 safe diagnostic: {})", REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC);
 
     g_d3d12_hook = this;
     g_inside_d3d12_hook = true;
@@ -581,7 +585,7 @@ bool D3D12Hook::hook() {
 
     s_command_queue_offset = 0;
     const auto wine = is_wine();
-    auto command_queue_refcount_probe = wine ? hold_refcount_probe(command_queue) : HeldRefcountProbe{};
+    auto command_queue_refcount_probe = (wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC) ? hold_refcount_probe(command_queue) : HeldRefcountProbe{};
     utility::ScopeGuard refcount_guard{[&]() {
         release_refcount_probe(command_queue_refcount_probe);
     }};
@@ -604,7 +608,7 @@ bool D3D12Hook::hook() {
         }
     }
 
-    if (s_command_queue_offset == 0 && wine) {
+    if (s_command_queue_offset == 0 && wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC) {
         s_command_queue_offset = scan_for_refcount_match(swap_chain1, command_queue_refcount_probe);
 
         if (s_command_queue_offset != 0) {
@@ -613,7 +617,7 @@ bool D3D12Hook::hook() {
     }
 
     // Wine/D3DMetal last resort: hardcoded offset discovered from swapchain memory dump
-    if (s_command_queue_offset == 0 && wine) {
+    if (s_command_queue_offset == 0 && wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC) {
         constexpr uint32_t WINE_D3DMETAL_CQ_OFFSET = 0x4C8;
         const auto base = (uintptr_t)swap_chain1 + WINE_D3DMETAL_CQ_OFFSET;
         if (!IsBadReadPtr((void*)base, sizeof(void*))) {
@@ -655,7 +659,7 @@ bool D3D12Hook::hook() {
 
                 auto data = *(ID3D12CommandQueue**)pre_data;
 
-                const auto matched_by_refcount = wine && matches_refcount_probe(data, command_queue_refcount_probe);
+                const auto matched_by_refcount = wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC && matches_refcount_probe(data, command_queue_refcount_probe);
 
                 if (data == command_queue || matched_by_refcount) {
                     // If we hook Streamline's Swapchain, the menu fails to render correctly/flickers
@@ -692,13 +696,13 @@ bool D3D12Hook::hook() {
     }
 
     if (s_command_queue_offset == 0) {
-        spdlog::error("Failed to find command queue offset");
+        spdlog::error("Failed to find command queue offset (GPTK4 diagnostic: heuristics disabled={})", REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC);
         return false;
     }
 
     // Wine/D3DMetal: compute delta between hook()'s command_queue and the raw pointer
     // stored inside the swapchain.  present() applies this delta arithmetically -- zero COM calls.
-    if (wine && s_command_queue_offset != 0) {
+    if (wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC && s_command_queue_offset != 0) {
         auto raw = *(uintptr_t*)((uintptr_t)swap_chain1 + s_command_queue_offset);
         s_wine_cq_delta = (intptr_t)((uintptr_t)command_queue - raw);
         if (s_wine_cq_delta != 0) {
@@ -850,7 +854,7 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
     }
 
     // Wine/D3DMetal: adjust raw swapchain pointer by pre-computed delta (zero COM calls)
-    if (s_wine_cq_delta != 0) {
+    if (!REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC && s_wine_cq_delta != 0) {
         d3d12->m_command_queue = (ID3D12CommandQueue*)((uintptr_t)d3d12->m_command_queue + s_wine_cq_delta);
     }
 
