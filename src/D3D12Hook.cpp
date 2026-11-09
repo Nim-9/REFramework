@@ -20,7 +20,7 @@
 
 // Diagnostic mode: disable heuristic Wine command-queue discovery.
 // Set to 0 to restore the original GPTK implementation.
-#define REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC 1
+#define REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC 0
 
 static D3D12Hook* g_d3d12_hook = nullptr;
 thread_local bool g_inside_d3d12_hook = false;
