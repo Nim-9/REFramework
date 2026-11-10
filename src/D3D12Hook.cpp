@@ -20,7 +20,7 @@
 
 // Diagnostic mode: disable heuristic Wine command-queue discovery.
 // Set to 0 to restore the original GPTK implementation.
-#define REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC 0
+#define REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC 1
 
 static D3D12Hook* g_d3d12_hook = nullptr;
 thread_local bool g_inside_d3d12_hook = false;
@@ -581,6 +581,8 @@ bool D3D12Hook::hook() {
     }
 
 
+    spdlog::info("[GPTK4] Queue discovery begins: swapchain={:p}, queue={:p}, scan_bytes={}",
+                 static_cast<void*>(swap_chain1), static_cast<void*>(command_queue), COMMAND_QUEUE_SCAN_BYTES);
     spdlog::info("Finding command queue offset");
 
     s_command_queue_offset = 0;
@@ -590,12 +592,14 @@ bool D3D12Hook::hook() {
         release_refcount_probe(command_queue_refcount_probe);
     }};
 
-    // Find the command queue offset in the swapchain (direct pointer comparison only)
+    // Only compare pointer values. Never invoke COM methods on arbitrary memory.
+    spdlog::info("[GPTK4] Starting direct pointer scan");
     for (auto i = 0; i < COMMAND_QUEUE_SCAN_BYTES; i += sizeof(void*)) {
         const auto base = (uintptr_t)swap_chain1 + i;
 
         // reached the end
         if (IsBadReadPtr((void*)base, sizeof(void*))) {
+            spdlog::warn("[GPTK4] Direct scan stopped at unreadable offset 0x{:x}", i);
             break;
         }
 
@@ -607,6 +611,8 @@ bool D3D12Hook::hook() {
             break;
         }
     }
+
+    spdlog::info("[GPTK4] Direct pointer scan finished; offset=0x{:x}", s_command_queue_offset);
 
     if (s_command_queue_offset == 0 && wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC) {
         s_command_queue_offset = scan_for_refcount_match(swap_chain1, command_queue_refcount_probe);
@@ -631,9 +637,9 @@ bool D3D12Hook::hook() {
 
     auto target_swapchain = swap_chain;
 
-    // Scan throughout the swapchain for a valid pointer to scan through
-    // this is usually only necessary for Proton
-    if (s_command_queue_offset == 0) {
+    // Nested scanning dereferences untrusted addresses. Keep it for native Windows,
+    // but never use it in Wine/GPTK until its object layout is verified.
+    if (s_command_queue_offset == 0 && !wine) {
         bool should_break = false;
 
         for (auto base = 0; base < COMMAND_QUEUE_SCAN_BYTES; base += sizeof(void*)) {
@@ -696,9 +702,10 @@ bool D3D12Hook::hook() {
     }
 
     if (s_command_queue_offset == 0) {
-        spdlog::error("Failed to find command queue offset (GPTK4 diagnostic: heuristics disabled={})", REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC);
+        spdlog::error("[GPTK4] No direct command queue pointer found; Wine nested scan and unsafe refcount/hardcoded fallbacks disabled. This is a layout mismatch, not a verified offset.");
         return false;
     }
+    spdlog::info("[GPTK4] Queue discovery succeeded: offset=0x{:x}, wine={}", s_command_queue_offset, wine);
 
     // Wine/D3DMetal: compute delta between hook()'s command_queue and the raw pointer
     // stored inside the swapchain.  present() applies this delta arithmetically -- zero COM calls.
