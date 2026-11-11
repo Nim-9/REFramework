@@ -66,8 +66,6 @@ void D3D12Hook::initialize_factory_hooks() try {
     // Install before waiting for the engine VM/renderer. No D3D12 device or
     // game state is needed, and callbacks do not wait for g_framework.
     if (!is_wine() || (s_create_swapchain_hook.installed() && s_create_legacy_hook.installed() &&
-    }
-    if (is_wine() && !s_create_core_hook.installed()) {
         s_create_core_hook.installed() && s_create_composition_hook.installed())) {
         return;
     }
