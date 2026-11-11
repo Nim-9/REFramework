@@ -11,6 +11,7 @@
 #include <dxgi1_4.h>
 
 #include "utility/PointerHook.hpp"
+#include "DXGIFactoryHook.hpp"
 #include "utility/FunctionHook.hpp"
 #include "utility/VtableHook.hpp"
 
@@ -146,10 +147,10 @@ protected:
     static inline Streamline s_streamline{};
 
     // This is static because unhooking it seems to cause a crash sometimes
-    static inline std::unique_ptr<PointerHook> s_create_swapchain_hook{};
-    static inline std::unique_ptr<PointerHook> s_create_legacy_hook{};
-    static inline std::unique_ptr<PointerHook> s_create_core_hook{};
-    static inline std::unique_ptr<PointerHook> s_create_composition_hook{};
+    static inline DXGIFactoryHook s_create_swapchain_hook{};
+    static inline DXGIFactoryHook s_create_legacy_hook{};
+    static inline DXGIFactoryHook s_create_core_hook{};
+    static inline DXGIFactoryHook s_create_composition_hook{};
     static inline void** s_factory_vtable{ nullptr };
     static inline void** s_swapchain_vtable{ nullptr };
     

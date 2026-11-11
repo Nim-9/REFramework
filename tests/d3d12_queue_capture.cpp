@@ -1,5 +1,7 @@
 // Real D3D12 WARP/DXGI smoke test. Run on Windows; no RE engine required.
 #include "../src/D3D12QueueCapture.hpp"
+#include "../src/DXGIFactoryHook.hpp"
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 using Microsoft::WRL::ComPtr;
@@ -10,7 +12,28 @@ static void require(bool ok, const char* message) {
 static void check(HRESULT hr, const char* message) {
     if (FAILED(hr)) { std::fprintf(stderr, "%s: %08lx\n", message, (unsigned long)hr); std::exit(1); }
 }
+static DXGIFactoryHook publication_hook;
+static int WINAPI original_call() { return 42; }
+static int WINAPI replaced_call() { return publication_hook.get_original<decltype(original_call)*>()(); }
+
 int main() {
+    void* slot = reinterpret_cast<void*>(&original_call);
+    std::atomic<bool> start{}, stop{}, bad{};
+    std::thread caller{[&] {
+        start.store(true);
+        while (!stop.load()) {
+            auto fn = reinterpret_cast<decltype(original_call)*>(InterlockedCompareExchangePointer(&slot, nullptr, nullptr));
+            if (fn() != 42) bad.store(true);
+        }
+    }};
+    while (!start.load()) std::this_thread::yield();
+    publication_hook.install(&slot, reinterpret_cast<void*>(&replaced_call));
+    require(replaced_call() == 42, "callback original must be published");
+    stop.store(true); caller.join();
+    require(!bad.load(), "concurrent hook entry must call the saved original");
+    publication_hook.remove();
+    require(slot == reinterpret_cast<void*>(&original_call), "factory slot must restore");
+
     ComPtr<IDXGIFactory4> factory;
     check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "factory");
     ComPtr<IDXGIAdapter> warp;
