@@ -110,6 +110,7 @@ protected:
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_captured_queue;
     IDXGISwapChain3* m_captured_swapchain{};
     bool m_queue_warning{};
+    bool m_device_warning{};
     
     ID3D12Device4* m_device{ nullptr };
     IDXGISwapChain3* m_swap_chain{ nullptr };

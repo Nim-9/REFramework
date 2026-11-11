@@ -45,10 +45,27 @@ not committed (they include machine paths and installed mods).
 The available RE2 log is NOT a successful baseline. User-reported RE2 success is
 not contradicted by a failed run of a different DLL, but cannot be compared as a
 successful path without that run's log and runtime metadata. None of these logs
-proves GPTK 4 Beta 3 or GPTK 3. notproton build files say CrossOver 26.3.0.39832;
-backend records/launcher logs have different timestamps and cannot identify the
-D3DMetal binary loaded by these sessions. RE9 also loaded custom pak mods, so it
-is not an isolated clean baseline.
+alone proves GPTK 4 Beta 3 or GPTK 3.
+
+Parsing the full appended notproton launcher records (rather than just their
+first entries) found matching or nearby game launches:
+
+| Game log start | Nearby launcher start (+03) | Selected runner label |
+|---|---|---|
+| RE2R Nov 11 12:46:20 | Nov 11 12:46:00 | stock 26.3.0.39832 |
+| RE3R Nov 10 12:50:37 | Nov 10 12:50:29 | stock 26.3.0.39832 |
+| RE4R Nov 10 12:48:27 | Nov 10 12:48:19 | stock 26.3.0.39832 |
+
+Earlier RE2 launches on Nov 11 11:57/12:15/12:19 selected
+26.3.0.39832-gptk4b3. Current on-disk D3DMetal metadata reports **3.0** in the
+stock runner (SHA-256 05a7beaed4494a4f5f53d3f626a82fffc3b70146436a908b7048a0632a49e1a8)
+and **4.0b3** in the separate gptk4b3 runner (SHA-256
+8720c3734ce08b7ea5a7cf67d649fc13cc9c0407e96b20b9cdb9f4b169e2195b).
+These are current inventory hashes, not historical loaded-module hashes. The
+launcher correlation points to a mixed-runtime comparison and is not conclusive
+proof of the D3DMetal binary loaded by the old processes. Do not call the three
+stock-runner failures verified Beta 3 tests. RE9 provenance is still unresolved;
+it also loaded custom pak mods, so it is not an isolated clean baseline.
 
 The concrete RE3/RE4 failure is the offset gate in graphics initialization.
 The RE9 ending is evidence of the last recorded stage, NOT proof of a crash

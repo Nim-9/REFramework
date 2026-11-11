@@ -77,6 +77,9 @@ void D3D12Hook::initialize_factory_hooks() {
         spdlog::error("[DXGI capture] Early factory creation failed: {:x}", (uint32_t)hr);
         return;
     }
+    const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+    const auto version = reinterpret_cast<const char* (*)()>(GetProcAddress(ntdll, "wine_get_version"));
+    spdlog::info("[DXGI capture] Wine version: {} (does not identify GPTK/D3DMetal revision)", version ? version() : "unknown");
     s_factory_vtable = *reinterpret_cast<void***>(factory.Get());
     install_factory_hooks();
     spdlog::info("[DXGI capture] Factory hooks installed before engine initialization");
@@ -375,7 +378,8 @@ bool D3D12Hook::hook() {
         }
 
         IDXGIAdapter* adapter{ nullptr };
-        wine_factory->EnumAdapters(0, &adapter);
+        const auto enum_hr = wine_factory->EnumAdapters(0, &adapter);
+        spdlog::info("[D3D12 bootstrap] EnumAdapters(0) hr={:x}", (uint32_t)enum_hr);
         wine_factory->Release();
 
         if (adapter == nullptr) {
@@ -383,6 +387,11 @@ bool D3D12Hook::hook() {
             return false;
         }
 
+        DXGI_ADAPTER_DESC adapter_desc{};
+        if (SUCCEEDED(adapter->GetDesc(&adapter_desc))) {
+            spdlog::info("[D3D12 bootstrap] Adapter: {}, vendor={:x}, device={:x}, feature_level={:x}",
+                utility::narrow(adapter_desc.Description), adapter_desc.VendorId, adapter_desc.DeviceId, (uint32_t)feature_level);
+        }
         auto hr = d3d12_create_device(adapter, feature_level, IID_PPV_ARGS(&device));
         adapter->Release();
 
@@ -763,7 +772,13 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
 
     {
         Microsoft::WRL::ComPtr<ID3D12Device4> temp_device{};
-        swap_chain->GetDevice(IID_PPV_ARGS(&temp_device));
+        const auto device_hr = swap_chain->GetDevice(IID_PPV_ARGS(&temp_device));
+        if (FAILED(device_hr) && !d3d12->m_device_warning) {
+            spdlog::error("[D3D12] Swapchain GetDevice(ID3D12Device4) failed: {:x}; renderer callbacks deferred", (uint32_t)device_hr);
+            d3d12->m_device_warning = true;
+        } else if (SUCCEEDED(device_hr)) {
+            d3d12->m_device_warning = false;
+        }
         d3d12->m_device = temp_device.Get();
     }
 
