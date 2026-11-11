@@ -1,7 +1,7 @@
 # GPTK 4 compatibility investigation
 
 Status: experimental source fix, not a claim of game compatibility. No game has
-been run with this change yet. Windows CI and WARP cannot validate D3DMetal.
+been run with this change yet. Windows CI and WARP cannot establish game compatibility; isolated D3DMetal tests below validate only the queue mechanism.
 
 ## Source evidence
 
@@ -67,6 +67,11 @@ proof of the D3DMetal binary loaded by the old processes. Do not call the three
 stock-runner failures verified Beta 3 tests. RE9 provenance is still unresolved;
 it also loaded custom pak mods, so it is not an isolated clean baseline.
 
+RE3/RE4 crash dumps were also found, but their headers date them to Nov 2 and
+Nov 5 respectively, so they do not match the Nov 10 failure sessions. Later Nov 10
+macOS Wine reports show code-signature termination at different times. Neither
+is used as a backtrace of the RE9 queue-recovery session.
+
 The concrete RE3/RE4 failure is the offset gate in graphics initialization.
 The RE9 ending is evidence of the last recorded stage, NOT proof of a crash
 location or of a queue-offset-only cause. A crash backtrace is still needed.
@@ -84,7 +89,11 @@ are guessed from those warnings.
 * Capture pDevice via documented CreateSwapChain, CreateSwapChainForHwnd,
   CreateSwapChainForCoreWindow and CreateSwapChainForComposition entry points.
   D3D12 passes a command queue here; D3D11 passes a device and is rejected by QI.
-* Validate DIRECT queue type and queue/swapchain device IUnknown identity. Store
+* Validate DIRECT queue type and queue/swapchain device identity. Try canonical
+  IUnknown first; if unavailable, require exact equality after both sides request
+  the same ID3D12Device interface. Both 4.0b3 and 3.0 actually returned E_NOINTERFACE
+  for device IUnknown in isolated tests. Different typed pointers are rejected;
+  no refcount, pointer arithmetic or arbitrary-memory inference is involved. Store
   the association using DXGI SetPrivateDataInterface, which owns its COM reference.
   Retrieve through GetPrivateData, retain with ComPtr, and validate against the
   device used for rendering. No arbitrary pointer is invoked on the Wine path.
@@ -101,12 +110,40 @@ are guessed from those warnings.
 * Extend existing Dev Release workflow with real Windows WARP queue tests:
   concurrent factory-hook publication/restoration, missing association, device
   input rejection, compute queue rejection, interface
-  alias retrieval, exact queue identity, wrong device rejection, cleared data.
+  alias retrieval (including Device4), exact queue identity, wrong device rejection,
+  cleared data, real command-list submission and fence completion.
 
 API contracts: [CreateSwapChain](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgifactory-createswapchain),
 [SetPrivateDataInterface](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiobject-setprivatedatainterface),
 [GetPrivateData](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiobject-getprivatedata).
 Factory vtable indices are SDK COM interface slots, not game/object memory offsets.
+
+## Isolated D3DMetal runtime evidence (November 11, 2026)
+
+Built the repository test with x86_64-w64-mingw32-g++ 16.2.0, C++20, static
+runtime, linking d3d12/dxgi/user32/uuid. Ran `queue_capture_mingw.exe --hardware`
+in an isolated Wine prefix using the existing CrossOver 26.3 runners on Apple
+M2 Pro. Set CX_ROOT, CX_GRAPHICS_BACKEND=d3dmetal and
+CX_APPLEGPTK_LIBD3DSHARED_PATH; dyld output confirmed the exact D3DMetal paths.
+An initial attempt without CX_ROOT selected VKD3D and is excluded from D3DMetal
+results. Merely naming a runner or setting CX_GRAPHICS_BACKEND was insufficient.
+
+| Actual loaded framework | Time (+03) | Result |
+|---|---|---|
+| D3DMetal 4.0b3, SHA-256 8720c3734ce08b7ea5a7cf67d649fc13cc9c0407e96b20b9cdb9f4b169e2195b | 13:18:01 | exit 0, queue tests pass, Device4 retrieval and real submission/fence completion pass |
+| D3DMetal 3.0, SHA-256 05a7beaed4494a4f5f53d3f626a82fffc3b70146436a908b7048a0632a49e1a8 | 13:18:07 | exit 0, same checks pass |
+
+Before typed-interface fallback, both queue and swapchain GetDevice succeeded
+with identical pointers, but device QueryInterface(IUnknown) returned 0x80004002.
+Canonical-identity-only validation therefore rejected a real matching device with
+0x80070057. SetPrivateDataInterface itself returned S_OK. The corrected validation
+passes association and retrieval through SwapChain1/3 and Device4, rejects a
+non-queue, a compute queue and a wrong device, and handles clearing private data.
+The concurrent saved-original publication/restoration test also passes.
+
+This is direct runtime evidence for the queue compatibility mechanism on both
+framework versions. It does not run the factory hooks inside REFramework, render
+ImGui, run any game, or establish upscaler/frame-generation/VR compatibility.
 
 ## Remaining limits and exact runtime tests
 
