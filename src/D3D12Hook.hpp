@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <functional>
+#include <wrl/client.h>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi")
@@ -98,10 +99,17 @@ public:
         m_ignore_next_present = true;
     }
 
+    static void initialize_factory_hooks();
+
     static void hook_streamline(HMODULE dlssg_module = nullptr);
 
 protected:
     void hook_impl();
+    static void install_factory_hooks();
+    static void capture_queue(IUnknown* device, IDXGISwapChain* swapchain, const char* source);
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_captured_queue;
+    IDXGISwapChain3* m_captured_swapchain{};
+    bool m_queue_warning{};
     
     ID3D12Device4* m_device{ nullptr };
     IDXGISwapChain3* m_swap_chain{ nullptr };
@@ -138,6 +146,9 @@ protected:
 
     // This is static because unhooking it seems to cause a crash sometimes
     static inline std::unique_ptr<PointerHook> s_create_swapchain_hook{};
+    static inline std::unique_ptr<PointerHook> s_create_legacy_hook{};
+    static inline std::unique_ptr<PointerHook> s_create_core_hook{};
+    static inline std::unique_ptr<PointerHook> s_create_composition_hook{};
     static inline void** s_factory_vtable{ nullptr };
     static inline void** s_swapchain_vtable{ nullptr };
     
@@ -150,6 +161,9 @@ protected:
     static HRESULT WINAPI present(IDXGISwapChain3* swap_chain, uint64_t sync_interval, uint64_t flags, void* r9);
     static HRESULT WINAPI resize_buffers(IDXGISwapChain3* swap_chain, UINT buffer_count, UINT width, UINT height, DXGI_FORMAT new_format, UINT swap_chain_flags);
     static HRESULT WINAPI resize_target(IDXGISwapChain3* swap_chain, const DXGI_MODE_DESC* new_target_parameters);
-    static HRESULT WINAPI create_swapchain(IDXGIFactory4* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* p_fullscreen_desc, IDXGIOutput* p_restrict_to_output, IDXGISwapChain** swap_chain);
+    static HRESULT WINAPI create_swapchain(IDXGIFactory4* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* p_fullscreen_desc, IDXGIOutput* p_restrict_to_output, IDXGISwapChain1** swap_chain);
+    static HRESULT WINAPI create_swapchain_legacy(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+    static HRESULT WINAPI create_swapchain_core(IDXGIFactory2*, IUnknown*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+    static HRESULT WINAPI create_swapchain_composition(IDXGIFactory2*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
 };
 
