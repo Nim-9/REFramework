@@ -4,6 +4,7 @@
 #include <thread>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 using Microsoft::WRL::ComPtr;
 using namespace d3d12::queue_capture;
 static void require(bool ok, const char* message) {
@@ -16,7 +17,7 @@ static DXGIFactoryHook publication_hook;
 static int WINAPI original_call() { return 42; }
 static int WINAPI replaced_call() { return publication_hook.get_original<decltype(original_call)*>()(); }
 
-int main() {
+int main(int argc, char** argv) {
     void* slot = reinterpret_cast<void*>(&original_call);
     std::atomic<bool> start{}, stop{}, bad{};
     std::thread caller{[&] {
@@ -37,9 +38,14 @@ int main() {
     ComPtr<IDXGIFactory4> factory;
     check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "factory");
     ComPtr<IDXGIAdapter> warp;
-    check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)), "WARP adapter");
+    const bool hardware = argc == 2 && std::strcmp(argv[1], "--hardware") == 0;
+    if (hardware) {
+        check(factory->EnumAdapters(0, &warp), "hardware adapter");
+    } else {
+        check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)), "WARP adapter");
+    }
     ComPtr<ID3D12Device> device;
-    check(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "WARP device");
+    check(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12 device");
     D3D12_COMMAND_QUEUE_DESC qd{};
     ComPtr<ID3D12CommandQueue> direct, compute;
     check(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&direct)), "direct queue");
@@ -72,5 +78,5 @@ int main() {
     require(FAILED(retrieve(sc3.Get(), device.Get(), captured)) && !captured, "cleared association must fail");
     sc3.Reset(); sc1.Reset();
     DestroyWindow(window);
-    std::puts("Queue capture WARP smoke test passed");
+    std::puts(hardware ? "Queue capture hardware smoke test passed" : "Queue capture WARP smoke test passed");
 }
