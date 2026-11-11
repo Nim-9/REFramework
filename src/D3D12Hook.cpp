@@ -17,109 +17,106 @@
 #include "WindowFilter.hpp"
 
 #include "D3D12Hook.hpp"
-
-// Diagnostic mode: disable heuristic Wine command-queue discovery.
-// Set to 0 to restore the original GPTK implementation.
-#define REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC 1
+#include "D3D12QueueCapture.hpp"
 
 static D3D12Hook* g_d3d12_hook = nullptr;
 thread_local bool g_inside_d3d12_hook = false;
 static constexpr auto COMMAND_QUEUE_SCAN_BYTES = 512 * sizeof(void*);
-static intptr_t s_wine_cq_delta = 0;
 
 static bool is_wine() {
-    static int cached = -1;
-    if (cached == -1) {
-        auto ntdll = GetModuleHandleA("ntdll.dll");
-        cached = (ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr) ? 1 : 0;
-    }
-    return cached == 1;
+    static const bool detected = [] {
+        const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll != nullptr && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+    }();
+    return detected;
 }
 
-struct HeldRefcountProbe {
-    IUnknown* object{};
-    ULONG held_refcount{};
-    bool valid{};
-};
-
-static HeldRefcountProbe hold_refcount_probe(IUnknown* object) {
-    HeldRefcountProbe probe{};
-
-    if (object == nullptr || IsBadReadPtr(object, sizeof(void*))) {
-        return probe;
-    }
-
-    __try {
-        probe.object = object;
-        probe.held_refcount = object->AddRef();
-        probe.valid = true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Ignore crash on invalid COM pointer
-    }
-
-    return probe;
-}
-
-static void release_refcount_probe(HeldRefcountProbe& probe) {
-    if (!probe.valid || probe.object == nullptr) {
+void D3D12Hook::capture_queue(IUnknown* device, IDXGISwapChain* swapchain, const char* source) {
+    if (g_inside_d3d12_hook || device == nullptr || swapchain == nullptr) {
         return;
     }
 
-    __try {
-        probe.object->Release();
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Ignore crash on invalid COM pointer
-    }
+    const auto hr = d3d12::queue_capture::associate(device, swapchain);
+    // E_NOINTERFACE is expected for a D3D11 device; leave its swapchain alone.
+    if (hr == E_NOINTERFACE) return;
+    spdlog::info("[DXGI capture] {} swapchain={:x}, input={:x}, association_hr={:x}",
+        source, (uintptr_t)swapchain, (uintptr_t)device, (uint32_t)hr);
 
-    probe.valid = false;
-    probe.object = nullptr;
-    probe.held_refcount = 0;
-}
-
-static bool matches_refcount_probe(IUnknown* candidate, const HeldRefcountProbe& probe) {
-    if (!probe.valid || candidate == nullptr || IsBadReadPtr(candidate, sizeof(void*))) {
-        return false;
-    }
-
-    bool match = false;
-
-    __try {
-        const auto addref_result = candidate->AddRef();
-        const auto release_result = candidate->Release();
-        match = addref_result == probe.held_refcount + 1 && release_result == probe.held_refcount;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Ignore crash on invalid COM pointer
-    }
-
-    return match;
-}
-
-static uint32_t scan_for_refcount_match(void* object, const HeldRefcountProbe& probe) {
-    if (object == nullptr || !probe.valid) {
-        return 0;
-    }
-
-    // Wine/D3DMetal can surface the same queue through a different COM interface pointer.
-    // Matching AddRef/Release return values avoids QueryInterface in this hot path.
-    for (auto i = 0; i < COMMAND_QUEUE_SCAN_BYTES; i += sizeof(void*)) {
-        const auto base = (uintptr_t)object + i;
-
-        if (IsBadReadPtr((void*)base, sizeof(void*))) {
-            break;
-        }
-
-        auto data = *(IUnknown**)base;
-
-        if (matches_refcount_probe(data, probe)) {
-            return i;
+    if (SUCCEEDED(hr) && g_framework != nullptr) {
+        std::scoped_lock lock{g_framework->get_hook_monitor_mutex()};
+        // A replacement or wrapped swapchain need not share the dummy vtable.
+        // Re-arm after creation, using the returned object's actual interface.
+        if (g_d3d12_hook != nullptr && g_d3d12_hook->m_hooked &&
+            swapchain != g_d3d12_hook->m_swap_chain) {
+            Microsoft::WRL::ComPtr<IDXGISwapChain3> sc3;
+            if (SUCCEEDED(swapchain->QueryInterface(IID_PPV_ARGS(&sc3)))) {
+                g_framework->on_reset();
+                g_d3d12_hook->unhook();
+                s_swapchain_vtable = *reinterpret_cast<void***>(sc3.Get());
+                g_d3d12_hook->m_captured_queue.Reset();
+                g_d3d12_hook->m_captured_swapchain = nullptr;
+                g_d3d12_hook->hook_impl();
+                spdlog::info("[DXGI capture] Re-armed Present for created swapchain");
+            }
         }
     }
+}
 
-    return 0;
+void D3D12Hook::initialize_factory_hooks() {
+    // Install before waiting for the engine VM/renderer. No D3D12 device or
+    // game state is needed, and callbacks do not wait for g_framework.
+    if (!is_wine() || s_create_swapchain_hook != nullptr) {
+        return;
+    }
+    const auto dxgi = LoadLibraryW(L"dxgi.dll");
+    const auto create = dxgi == nullptr ? nullptr :
+        reinterpret_cast<decltype(CreateDXGIFactory)*>(GetProcAddress(dxgi, "CreateDXGIFactory"));
+    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+    const auto hr = create == nullptr ? E_NOINTERFACE : create(IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) {
+        spdlog::error("[DXGI capture] Early factory creation failed: {:x}", (uint32_t)hr);
+        return;
+    }
+    s_factory_vtable = *reinterpret_cast<void***>(factory.Get());
+    install_factory_hooks();
+    spdlog::info("[DXGI capture] Factory hooks installed before engine initialization");
+}
+
+void D3D12Hook::install_factory_hooks() {
+    if (s_create_swapchain_hook == nullptr) {
+        s_create_swapchain_hook = std::make_unique<PointerHook>(&s_factory_vtable[15], &D3D12Hook::create_swapchain);
+    }
+    if (is_wine() && s_create_legacy_hook == nullptr) {
+        s_create_legacy_hook = std::make_unique<PointerHook>(&s_factory_vtable[10], &D3D12Hook::create_swapchain_legacy);
+        s_create_core_hook = std::make_unique<PointerHook>(&s_factory_vtable[16], &D3D12Hook::create_swapchain_core);
+        s_create_composition_hook = std::make_unique<PointerHook>(&s_factory_vtable[24], &D3D12Hook::create_swapchain_composition);
+    }
+}
+
+HRESULT WINAPI D3D12Hook::create_swapchain_legacy(IDXGIFactory* factory, IUnknown* device,
+    DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** swapchain) {
+    const auto hr = s_create_legacy_hook->get_original<decltype(create_swapchain_legacy)*>()(factory, device, desc, swapchain);
+    if (SUCCEEDED(hr) && swapchain != nullptr) capture_queue(device, *swapchain, "CreateSwapChain");
+    return hr;
+}
+
+HRESULT WINAPI D3D12Hook::create_swapchain_core(IDXGIFactory2* factory, IUnknown* device, IUnknown* window,
+    const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* output, IDXGISwapChain1** swapchain) {
+    const auto hr = s_create_core_hook->get_original<decltype(create_swapchain_core)*>()(factory, device, window, desc, output, swapchain);
+    if (SUCCEEDED(hr) && swapchain != nullptr) capture_queue(device, *swapchain, "CreateSwapChainForCoreWindow");
+    return hr;
+}
+
+HRESULT WINAPI D3D12Hook::create_swapchain_composition(IDXGIFactory2* factory, IUnknown* device,
+    const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* output, IDXGISwapChain1** swapchain) {
+    const auto hr = s_create_composition_hook->get_original<decltype(create_swapchain_composition)*>()(factory, device, desc, output, swapchain);
+    if (SUCCEEDED(hr) && swapchain != nullptr) capture_queue(device, *swapchain, "CreateSwapChainForComposition");
+    return hr;
 }
 
 D3D12Hook::~D3D12Hook() {
     unhook();
+    if (g_d3d12_hook == this) g_d3d12_hook = nullptr;
 }
 
 void* D3D12Hook::Streamline::link_swapchain_to_cmd_queue(void* rcx, void* rdx, void* r8, void* r9) {
@@ -158,8 +155,14 @@ void* D3D12Hook::Streamline::link_swapchain_to_cmd_queue(void* rcx, void* rdx, v
     return result;
 }
 
-HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* p_fullscreen_desc, IDXGIOutput* p_restrict_to_output, IDXGISwapChain** swap_chain) {
+HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* p_fullscreen_desc, IDXGIOutput* p_restrict_to_output, IDXGISwapChain1** swap_chain) {
     auto create_swap_chain_fn = s_create_swapchain_hook->get_original<decltype(D3D12Hook::create_swapchain)*>();
+
+    if (is_wine()) {
+        const auto hr = create_swap_chain_fn(factory, device, hwnd, desc, p_fullscreen_desc, p_restrict_to_output, swap_chain);
+        if (SUCCEEDED(hr) && swap_chain != nullptr) capture_queue(device, *swap_chain, "CreateSwapChainForHwnd");
+        return hr;
+    }
 
     if (g_inside_d3d12_hook) {
         spdlog::info("create_swapchain (inside D3D12 hook)");
@@ -188,7 +191,6 @@ HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* dev
 
         s_factory_vtable = *(void***)factory;
         s_swapchain_vtable = *(void***)*swap_chain;
-        const auto wine = is_wine();
 
         // Find the command queue offset in the swapchain (direct pointer comparison only)
         for (auto i = 0; i < COMMAND_QUEUE_SCAN_BYTES; i += sizeof(void*)) {
@@ -204,32 +206,6 @@ HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* dev
                 s_command_queue_offset = i;
                 spdlog::info("Found command queue offset: {:x}", i);
                 break;
-            }
-        }
-
-        if (s_command_queue_offset == 0 && wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC) {
-            auto refcount_probe = hold_refcount_probe(device);
-            utility::ScopeGuard refcount_guard{[&]() {
-                release_refcount_probe(refcount_probe);
-            }};
-
-            s_command_queue_offset = scan_for_refcount_match(*swap_chain, refcount_probe);
-
-            if (s_command_queue_offset != 0) {
-                spdlog::info("Found command queue offset via Wine refcount scan: {:x}", s_command_queue_offset);
-            }
-        }
-
-        // Wine/D3DMetal last resort: hardcoded offset from swapchain memory dump
-        if (s_command_queue_offset == 0 && wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC) {
-            constexpr uint32_t WINE_D3DMETAL_CQ_OFFSET = 0x4C8;
-            const auto base = (uintptr_t)*swap_chain + WINE_D3DMETAL_CQ_OFFSET;
-            if (!IsBadReadPtr((void*)base, sizeof(void*))) {
-                auto candidate = *(IUnknown**)base;
-                if (candidate != nullptr && !IsBadReadPtr((void*)candidate, sizeof(void*))) {
-                    s_command_queue_offset = WINE_D3DMETAL_CQ_OFFSET;
-                    spdlog::warn("Wine: Using hardcoded command queue offset 0x{:x} (D3DMetal fallback)", WINE_D3DMETAL_CQ_OFFSET);
-                }
             }
         }
 
@@ -305,7 +281,7 @@ void D3D12Hook::hook_streamline(HMODULE dlssg_module) try {
 }
 
 bool D3D12Hook::hook() {
-    spdlog::info("Hooking D3D12 (GPTK4 safe diagnostic: {})", REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC);
+    spdlog::info("Hooking D3D12 (Wine DXGI queue capture: {})", is_wine());
 
     g_d3d12_hook = this;
     g_inside_d3d12_hook = true;
@@ -314,7 +290,7 @@ bool D3D12Hook::hook() {
         g_inside_d3d12_hook = false;
     }};
 
-    if (s_command_queue_offset != 0 && s_swapchain_vtable != nullptr && s_factory_vtable != nullptr) {
+    if ((is_wine() || s_command_queue_offset != 0) && s_swapchain_vtable != nullptr && s_factory_vtable != nullptr) {
         spdlog::info("Reinitializing D3D12Hook via known pointers");
 
         try {
@@ -330,6 +306,19 @@ bool D3D12Hook::hook() {
     IDXGISwapChain1* swap_chain1{ nullptr };
     IDXGISwapChain3* swap_chain{ nullptr };
     ID3D12Device* device{ nullptr };
+    IDXGIFactory4* factory{ nullptr };
+    ID3D12CommandQueue* command_queue{ nullptr };
+    HWND hwnd = 0;
+    WNDCLASSEX wc{};
+    utility::ScopeGuard cleanup{[&]() {
+        if (swap_chain) swap_chain->Release();
+        if (swap_chain1) swap_chain1->Release();
+        if (command_queue) command_queue->Release();
+        if (device) device->Release();
+        if (factory) factory->Release();
+        if (hwnd) ::DestroyWindow(hwnd);
+        if (wc.lpszClassName) ::UnregisterClass(wc.lpszClassName, wc.hInstance);
+    }};
 
     D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_0;
     DXGI_SWAP_CHAIN_DESC1 swap_chain_desc1;
@@ -439,7 +428,6 @@ bool D3D12Hook::hook() {
 
     spdlog::info("Creating dummy DXGI factory");
 
-    IDXGIFactory4* factory{ nullptr };
     if (FAILED(create_dxgi_factory(IID_PPV_ARGS(&factory)))) {
         spdlog::error("Failed to create D3D12 Dummy DXGI Factory");
         return false;
@@ -453,7 +441,6 @@ bool D3D12Hook::hook() {
 
     spdlog::info("Creating dummy command queue");
 
-    ID3D12CommandQueue* command_queue{ nullptr };
     if (FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&command_queue)))) {
         spdlog::error("Failed to create D3D12 Dummy Command Queue");
         return false;
@@ -462,8 +449,6 @@ bool D3D12Hook::hook() {
     spdlog::info("Creating dummy swapchain");
 
     // used in CreateSwapChainForHwnd fallback
-    HWND hwnd = 0;
-    WNDCLASSEX wc{};
 
     auto init_dummy_window = [&]() {
         // fallback to CreateSwapChainForHwnd
@@ -541,14 +526,6 @@ bool D3D12Hook::hook() {
     if (!any_succeed) {
         spdlog::error("Failed to create D3D12 Dummy Swap Chain");
 
-        if (hwnd) {
-            ::DestroyWindow(hwnd);
-        }
-
-        if (wc.lpszClassName != nullptr) {
-            ::UnregisterClass(wc.lpszClassName, wc.hInstance);
-        }
-
         return false;
     }
 
@@ -559,7 +536,7 @@ bool D3D12Hook::hook() {
         return false;
     }
 
-    try {
+    if (!is_wine()) try {
         const auto ti = utility::rtti::get_type_info(swap_chain1);
         const auto swapchain_classname = ti != nullptr && ti->name() != nullptr ? std::string_view{ti->name()} : "unknown";
         const auto raw_name = ti != nullptr && ti->raw_name() != nullptr ? std::string_view{ti->raw_name()} : "unknown";
@@ -581,140 +558,94 @@ bool D3D12Hook::hook() {
     }
 
 
-    spdlog::info("[GPTK4] Queue discovery begins: swapchain={:p}, queue={:p}, scan_bytes={}",
-                 static_cast<void*>(swap_chain1), static_cast<void*>(command_queue), COMMAND_QUEUE_SCAN_BYTES);
-    spdlog::info("Finding command queue offset");
-
-    s_command_queue_offset = 0;
-    const auto wine = is_wine();
-    auto command_queue_refcount_probe = (wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC) ? hold_refcount_probe(command_queue) : HeldRefcountProbe{};
-    utility::ScopeGuard refcount_guard{[&]() {
-        release_refcount_probe(command_queue_refcount_probe);
-    }};
-
-    // Only compare pointer values. Never invoke COM methods on arbitrary memory.
-    spdlog::info("[GPTK4] Starting direct pointer scan");
-    for (auto i = 0; i < COMMAND_QUEUE_SCAN_BYTES; i += sizeof(void*)) {
-        const auto base = (uintptr_t)swap_chain1 + i;
-
-        // reached the end
-        if (IsBadReadPtr((void*)base, sizeof(void*))) {
-            spdlog::warn("[GPTK4] Direct scan stopped at unreadable offset 0x{:x}", i);
-            break;
-        }
-
-        auto data = *(ID3D12CommandQueue**)base;
-
-        if (data == command_queue) {
-            s_command_queue_offset = i;
-            spdlog::info("Found command queue offset: {:x}", i);
-            break;
-        }
-    }
-
-    spdlog::info("[GPTK4] Direct pointer scan finished; offset=0x{:x}", s_command_queue_offset);
-
-    if (s_command_queue_offset == 0 && wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC) {
-        s_command_queue_offset = scan_for_refcount_match(swap_chain1, command_queue_refcount_probe);
-
-        if (s_command_queue_offset != 0) {
-            spdlog::info("Found command queue offset via Wine refcount scan: {:x}", s_command_queue_offset);
-        }
-    }
-
-    // Wine/D3DMetal last resort: hardcoded offset discovered from swapchain memory dump
-    if (s_command_queue_offset == 0 && wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC) {
-        constexpr uint32_t WINE_D3DMETAL_CQ_OFFSET = 0x4C8;
-        const auto base = (uintptr_t)swap_chain1 + WINE_D3DMETAL_CQ_OFFSET;
-        if (!IsBadReadPtr((void*)base, sizeof(void*))) {
-            auto candidate = *(ID3D12CommandQueue**)base;
-            if (candidate != nullptr && !IsBadReadPtr((void*)candidate, sizeof(void*))) {
-                s_command_queue_offset = WINE_D3DMETAL_CQ_OFFSET;
-                spdlog::warn("Wine: Using hardcoded command queue offset 0x{:x} (D3DMetal fallback)", WINE_D3DMETAL_CQ_OFFSET);
-            }
-        }
-    }
-
     auto target_swapchain = swap_chain;
-
-    // Nested scanning dereferences untrusted addresses. Keep it for native Windows,
-    // but never use it in Wine/GPTK until its object layout is verified.
-    if (s_command_queue_offset == 0 && !wine) {
-        bool should_break = false;
-
-        for (auto base = 0; base < COMMAND_QUEUE_SCAN_BYTES; base += sizeof(void*)) {
-            const auto pre_scan_base = (uintptr_t)swap_chain1 + base;
+    if (!is_wine()) {
+        // Preserve upstream native/Proton wrapper discovery. Wine never enters
+        // this block; translation-layer object layouts are not an API contract.
+        s_command_queue_offset = 0;
+        // Only compare pointer values. Never invoke COM methods on arbitrary memory.
+        spdlog::info("Native direct pointer scan");
+        for (auto i = 0; i < COMMAND_QUEUE_SCAN_BYTES; i += sizeof(void*)) {
+            const auto base = (uintptr_t)swap_chain1 + i;
 
             // reached the end
-            if (IsBadReadPtr((void*)pre_scan_base, sizeof(void*))) {
+            if (IsBadReadPtr((void*)base, sizeof(void*))) {
+                spdlog::warn("Native direct scan stopped at unreadable offset 0x{:x}", i);
                 break;
             }
 
-            const auto scan_base = *(uintptr_t*)pre_scan_base;
+            auto data = *(ID3D12CommandQueue**)base;
 
-            if (scan_base == 0 || IsBadReadPtr((void*)scan_base, sizeof(void*))) {
-                continue;
-            }
-
-            for (auto i = 0; i < COMMAND_QUEUE_SCAN_BYTES; i += sizeof(void*)) {
-                const auto pre_data = scan_base + i;
-
-                if (IsBadReadPtr((void*)pre_data, sizeof(void*))) {
-                    break;
-                }
-
-                auto data = *(ID3D12CommandQueue**)pre_data;
-
-                const auto matched_by_refcount = wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC && matches_refcount_probe(data, command_queue_refcount_probe);
-
-                if (data == command_queue || matched_by_refcount) {
-                    // If we hook Streamline's Swapchain, the menu fails to render correctly/flickers
-                    // So we switch out the swapchain with the internal one owned by Streamline
-                    // Side note: Even though we are scanning for Proton here,
-                    // this doubles as an offset scanner for the real swapchain inside Streamline (or FSR3)
-                    if (m_using_frame_generation_swapchain) {
-                        target_swapchain = (IDXGISwapChain3*)scan_base;
-                    }
-
-                    if (!m_using_frame_generation_swapchain) {
-                        m_using_proton_swapchain = true;
-                    }
-
-                    s_command_queue_offset = i;
-                    s_proton_swapchain_offset = base;
-                    should_break = true;
-
-                    if (matched_by_refcount) {
-                        spdlog::info("Proton potentially detected (via Wine refcount scan)");
-                        spdlog::info("Found command queue offset via Wine refcount scan: {:x}", i);
-                    } else {
-                        spdlog::info("Proton potentially detected");
-                        spdlog::info("Found command queue offset: {:x}", i);
-                    }
-                    break;
-                }
-            }
-
-            if (m_using_proton_swapchain || should_break) {
+            if (data == command_queue) {
+                s_command_queue_offset = i;
+                spdlog::info("Found command queue offset: {:x}", i);
                 break;
             }
         }
-    }
 
-    if (s_command_queue_offset == 0) {
-        spdlog::error("[GPTK4] No direct command queue pointer found; Wine nested scan and unsafe refcount/hardcoded fallbacks disabled. This is a layout mismatch, not a verified offset.");
-        return false;
-    }
-    spdlog::info("[GPTK4] Queue discovery succeeded: offset=0x{:x}, wine={}", s_command_queue_offset, wine);
 
-    // Wine/D3DMetal: compute delta between hook()'s command_queue and the raw pointer
-    // stored inside the swapchain.  present() applies this delta arithmetically -- zero COM calls.
-    if (wine && !REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC && s_command_queue_offset != 0) {
-        auto raw = *(uintptr_t*)((uintptr_t)swap_chain1 + s_command_queue_offset);
-        s_wine_cq_delta = (intptr_t)((uintptr_t)command_queue - raw);
-        if (s_wine_cq_delta != 0) {
-            spdlog::info("Wine command queue delta: 0x{:X}", s_wine_cq_delta);
+        // Nested scanning dereferences untrusted addresses. Keep it for native Windows,
+        // but never use it in Wine/GPTK until its object layout is verified.
+        if (s_command_queue_offset == 0) {
+            bool should_break = false;
+
+            for (auto base = 0; base < COMMAND_QUEUE_SCAN_BYTES; base += sizeof(void*)) {
+                const auto pre_scan_base = (uintptr_t)swap_chain1 + base;
+
+                // reached the end
+                if (IsBadReadPtr((void*)pre_scan_base, sizeof(void*))) {
+                    break;
+                }
+
+                const auto scan_base = *(uintptr_t*)pre_scan_base;
+
+                if (scan_base == 0 || IsBadReadPtr((void*)scan_base, sizeof(void*))) {
+                    continue;
+                }
+
+                for (auto i = 0; i < COMMAND_QUEUE_SCAN_BYTES; i += sizeof(void*)) {
+                    const auto pre_data = scan_base + i;
+
+                    if (IsBadReadPtr((void*)pre_data, sizeof(void*))) {
+                        break;
+                    }
+
+                    auto data = *(ID3D12CommandQueue**)pre_data;
+
+                    if (data == command_queue) {
+                        // If we hook Streamline's Swapchain, the menu fails to render correctly/flickers
+                        // So we switch out the swapchain with the internal one owned by Streamline
+                        // Side note: Even though we are scanning for Proton here,
+                        // this doubles as an offset scanner for the real swapchain inside Streamline (or FSR3)
+                        if (m_using_frame_generation_swapchain) {
+                            target_swapchain = (IDXGISwapChain3*)scan_base;
+                        }
+
+                        if (!m_using_frame_generation_swapchain) {
+                            m_using_proton_swapchain = true;
+                        }
+
+                        s_command_queue_offset = i;
+                        s_proton_swapchain_offset = base;
+                        should_break = true;
+
+                        spdlog::info("Native nested swapchain queue offset: {:x}", i);
+                        break;
+                    }
+                }
+
+                if (m_using_proton_swapchain || should_break) {
+                    break;
+                }
+            }
         }
+
+        if (s_command_queue_offset == 0) {
+            spdlog::error("Native command queue discovery failed");
+            return false;
+        }
+    } else {
+        spdlog::info("[DXGI capture] Present bootstrap ready; no swapchain memory scan required");
     }
 
     //utility::ThreadSuspender suspender{};
@@ -730,20 +661,6 @@ bool D3D12Hook::hook() {
     }
 
     //suspender.resume();
-
-    command_queue->Release();
-    swap_chain1->Release();
-    swap_chain->Release();
-    device->Release();
-    factory->Release();
-
-    if (hwnd) {
-        ::DestroyWindow(hwnd);
-    }
-
-    if (wc.lpszClassName != nullptr) {
-        ::UnregisterClass(wc.lpszClassName, wc.hInstance);
-    }
 
     return m_hooked;
 }
@@ -761,10 +678,7 @@ void D3D12Hook::hook_impl() {
     auto& present_fn = s_swapchain_vtable[8]; // Present
     m_present_hook = std::make_unique<PointerHook>(&present_fn, &D3D12Hook::present);
 
-    if (s_create_swapchain_hook == nullptr) {
-        auto& create_swapchain_fn = s_factory_vtable[15]; // CreateSwapChainForHwnd
-        s_create_swapchain_hook = std::make_unique<PointerHook>(&create_swapchain_fn, &D3D12Hook::create_swapchain);
-    }
+    install_factory_hooks();
 
     m_hooked = true;
 }
@@ -853,16 +767,31 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
         d3d12->m_device = temp_device.Get();
     }
 
-    if (d3d12->m_using_proton_swapchain) {
+    if (is_wine()) {
+        if (d3d12->m_captured_swapchain != swap_chain || d3d12->m_captured_queue == nullptr) {
+            Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+            const auto hr = d3d12::queue_capture::retrieve(swap_chain, d3d12->m_device, queue);
+            if (SUCCEEDED(hr)) {
+                d3d12->m_captured_queue = queue;
+                spdlog::info("[DXGI capture] Present validated swapchain={:x}, queue={:x}, device={:x}",
+                    (uintptr_t)swap_chain, (uintptr_t)queue.Get(), (uintptr_t)d3d12->m_device);
+                d3d12->m_queue_warning = false;
+            } else {
+                d3d12->m_captured_queue.Reset();
+                if (!d3d12->m_queue_warning) {
+                    spdlog::error("[DXGI capture] Present has no validated queue: private_data_hr={:x}, device={:x}. Capture may have missed creation; cold launch and inspect factory/engine startup logs.",
+                        (uint32_t)hr, (uintptr_t)d3d12->m_device);
+                    d3d12->m_queue_warning = true;
+                }
+            }
+            d3d12->m_captured_swapchain = swap_chain;
+        }
+        d3d12->m_command_queue = d3d12->m_captured_queue.Get();
+    } else if (d3d12->m_using_proton_swapchain) {
         const auto real_swapchain = *(uintptr_t*)((uintptr_t)swap_chain + d3d12->s_proton_swapchain_offset);
         d3d12->m_command_queue = *(ID3D12CommandQueue**)(real_swapchain + d3d12->s_command_queue_offset);
     } else {
         d3d12->m_command_queue = *(ID3D12CommandQueue**)((uintptr_t)swap_chain + d3d12->s_command_queue_offset);
-    }
-
-    // Wine/D3DMetal: adjust raw swapchain pointer by pre-computed delta (zero COM calls)
-    if (!REFRAMEWORK_GPTK4_SAFE_DIAGNOSTIC && s_wine_cq_delta != 0) {
-        d3d12->m_command_queue = (ID3D12CommandQueue*)((uintptr_t)d3d12->m_command_queue + s_wine_cq_delta);
     }
 
     if (d3d12->m_swapchain_0 == nullptr) {
@@ -903,7 +832,7 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
         return S_OK;
     }
 
-    if (d3d12->m_on_present) {
+    if (d3d12->m_on_present && d3d12->m_device != nullptr && d3d12->m_command_queue != nullptr) {
         d3d12->m_on_present(*d3d12);
     }
 
@@ -923,7 +852,7 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, uint64_t sync_int
 
     --g_present_depth;
 
-    if (d3d12->m_on_post_present) {
+    if (d3d12->m_on_post_present && d3d12->m_device != nullptr && d3d12->m_command_queue != nullptr) {
         d3d12->m_on_post_present(*d3d12);
     }
 

@@ -285,6 +285,11 @@ REFramework::REFramework(HMODULE reframework_module)
     spdlog::info("Build time: {}", REF_BUILD_TIME);
     spdlog::info("Game name: {}", REFramework::get_game_name());
 
+    // Capture queues before unpacking/VM/renderer waits can miss creation.
+    // This runs on the startup thread, outside DllMain's loader lock.
+    D3D12Hook::initialize_factory_hooks();
+    spdlog::info("[Startup] Graphics capture installed; engine startup begins (TDB {})", gi.tdb_ver());
+
     const auto module_size = *utility::get_module_size(m_game_module);
 
     spdlog::info("Game Module Addr: {:x}", (uintptr_t)m_game_module);
@@ -523,6 +528,7 @@ REFramework::REFramework(HMODULE reframework_module)
 
 
     if (gi.is_reengine_at()) {
+        spdlog::info("[Startup] Beginning game-specific integrity initialization (TDB {})", gi.tdb_ver());
         utility::ThreadSuspender suspender{};
         IntegrityCheckBypass::ignore_application_entries();
 
@@ -550,6 +556,7 @@ REFramework::REFramework(HMODULE reframework_module)
         // Seen in SF6
         IntegrityCheckBypass::remove_stack_destroyer();
         suspender.resume();
+        spdlog::info("[Startup] Game-specific integrity initialization completed");
     }
 
     // Load the plugins early right after executable unpacking
@@ -2616,6 +2623,10 @@ bool REFramework::init_d3d12() {
     deinit_d3d12();
     
     auto device = m_d3d12_hook->get_device();
+    if (device == nullptr || m_d3d12_hook->get_command_queue() == nullptr) {
+        spdlog::error("[D3D12] Initialization deferred: device or validated queue unavailable");
+        return false;
+    }
 
     spdlog::info("[D3D12] Creating DXTK graphics memory...");
 
@@ -2750,7 +2761,9 @@ bool REFramework::init_d3d12() {
         m_d3d12.rt_height = (uint32_t)desc.Height;
     }
 
-    spdlog::info("[D3D12] Initializing ImGui...");
+    spdlog::info("[D3D12] Initializing ImGui: device={:x}, queue={:x}, buffers={}, format={}",
+        (uintptr_t)device, (uintptr_t)m_d3d12_hook->get_command_queue(), swapchain_desc.BufferCount,
+        (int)m_d3d12.get_rt(D3D12::RTV::BACKBUFFER_0)->GetDesc().Format);
 
     auto& bb = m_d3d12.get_rt(D3D12::RTV::BACKBUFFER_0);
     auto bb_desc = bb->GetDesc();
