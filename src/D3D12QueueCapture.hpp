@@ -9,11 +9,17 @@ namespace d3d12::queue_capture {
 inline constexpr GUID key{
     0x9d34db89, 0x75ed, 0x462c, {0x9e, 0xd7, 0x70, 0x2e, 0x97, 0x93, 0x4d, 0x8b}};
 
-inline bool same_object(IUnknown* lhs, IUnknown* rhs) {
+template<typename T> inline bool same_interface(T* lhs, T* rhs) {
+    if (lhs == nullptr || rhs == nullptr) return false;
     Microsoft::WRL::ComPtr<IUnknown> a, b;
-    return lhs != nullptr && rhs != nullptr &&
-        SUCCEEDED(lhs->QueryInterface(IID_PPV_ARGS(&a))) &&
-        SUCCEEDED(rhs->QueryInterface(IID_PPV_ARGS(&b))) && a.Get() == b.Get();
+    const auto a_hr = lhs->QueryInterface(IID_PPV_ARGS(&a));
+    const auto b_hr = rhs->QueryInterface(IID_PPV_ARGS(&b));
+    if (SUCCEEDED(a_hr) && SUCCEEDED(b_hr)) return a.Get() == b.Get();
+    // D3DMetal 4.0b3 was observed returning E_NOINTERFACE for device IUnknown.
+    // Both inputs must already be the SAME requested, validated interface type.
+    // Exact equality of these live interface pointers is sufficient; unequal
+    // pointers are rejected rather than inferring identity from memory/refcounts.
+    return lhs == rhs;
 }
 
 inline HRESULT validate(ID3D12CommandQueue* queue, IUnknown* device) {
@@ -21,7 +27,10 @@ inline HRESULT validate(ID3D12CommandQueue* queue, IUnknown* device) {
     Microsoft::WRL::ComPtr<ID3D12Device> queue_device;
     const auto hr = queue->GetDevice(IID_PPV_ARGS(&queue_device));
     if (FAILED(hr)) return hr;
-    return same_object(queue_device.Get(), device) ? S_OK : E_INVALIDARG;
+    Microsoft::WRL::ComPtr<ID3D12Device> render_device;
+    const auto device_hr = device == nullptr ? E_POINTER : device->QueryInterface(IID_PPV_ARGS(&render_device));
+    if (FAILED(device_hr)) return device_hr;
+    return same_interface(queue_device.Get(), render_device.Get()) ? S_OK : E_INVALIDARG;
 }
 
 inline HRESULT associate(IUnknown* device_or_queue, IDXGISwapChain* swapchain) {
