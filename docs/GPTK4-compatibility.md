@@ -78,6 +78,9 @@ are guessed from those warnings.
 
 * Install Wine DXGI factory capture on the startup thread immediately after the
   logger/build identity starts, before unpacking, integrity work and engine waits.
+* Publish factory-hook originals before changing vtable slots, so a concurrent
+  game call can safely enter during installation. Preserve later overlay hooks
+  during removal. Catch and log early installation failures.
 * Capture pDevice via documented CreateSwapChain, CreateSwapChainForHwnd,
   CreateSwapChainForCoreWindow and CreateSwapChainForComposition entry points.
   D3D12 passes a command queue here; D3D11 passes a device and is rejected by QI.
@@ -96,7 +99,8 @@ are guessed from those warnings.
   uses the same API-based capture; regression testing is mandatory.
 * Add engine-integrity stage markers and ImGui device/queue/buffer/format logs.
 * Extend existing Dev Release workflow with real Windows WARP queue tests:
-  missing association, device input rejection, compute queue rejection, interface
+  concurrent factory-hook publication/restoration, missing association, device
+  input rejection, compute queue rejection, interface
   alias retrieval, exact queue identity, wrong device rejection, cleared data.
 
 API contracts: [CreateSwapChain](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgifactory-createswapchain),

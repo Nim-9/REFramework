@@ -62,10 +62,13 @@ void D3D12Hook::capture_queue(IUnknown* device, IDXGISwapChain* swapchain, const
     }
 }
 
-void D3D12Hook::initialize_factory_hooks() {
+void D3D12Hook::initialize_factory_hooks() try {
     // Install before waiting for the engine VM/renderer. No D3D12 device or
     // game state is needed, and callbacks do not wait for g_framework.
-    if (!is_wine() || s_create_swapchain_hook != nullptr) {
+    if (!is_wine() || (s_create_swapchain_hook.installed() && s_create_legacy_hook.installed() &&
+    }
+    if (is_wine() && !s_create_core_hook.installed()) {
+        s_create_core_hook.installed() && s_create_composition_hook.installed())) {
         return;
     }
     const auto dxgi = LoadLibraryW(L"dxgi.dll");
@@ -83,36 +86,42 @@ void D3D12Hook::initialize_factory_hooks() {
     s_factory_vtable = *reinterpret_cast<void***>(factory.Get());
     install_factory_hooks();
     spdlog::info("[DXGI capture] Factory hooks installed before engine initialization");
+} catch (const std::exception& e) {
+    spdlog::error("[DXGI capture] Early factory hooks failed: {}", e.what());
 }
 
 void D3D12Hook::install_factory_hooks() {
-    if (s_create_swapchain_hook == nullptr) {
-        s_create_swapchain_hook = std::make_unique<PointerHook>(&s_factory_vtable[15], &D3D12Hook::create_swapchain);
+    if (!s_create_swapchain_hook.installed()) {
+        s_create_swapchain_hook.install(&s_factory_vtable[15], reinterpret_cast<void*>(&D3D12Hook::create_swapchain));
     }
-    if (is_wine() && s_create_legacy_hook == nullptr) {
-        s_create_legacy_hook = std::make_unique<PointerHook>(&s_factory_vtable[10], &D3D12Hook::create_swapchain_legacy);
-        s_create_core_hook = std::make_unique<PointerHook>(&s_factory_vtable[16], &D3D12Hook::create_swapchain_core);
-        s_create_composition_hook = std::make_unique<PointerHook>(&s_factory_vtable[24], &D3D12Hook::create_swapchain_composition);
+    if (is_wine() && !s_create_legacy_hook.installed()) {
+        s_create_legacy_hook.install(&s_factory_vtable[10], reinterpret_cast<void*>(&D3D12Hook::create_swapchain_legacy));
+    }
+    if (is_wine() && !s_create_core_hook.installed()) {
+        s_create_core_hook.install(&s_factory_vtable[16], reinterpret_cast<void*>(&D3D12Hook::create_swapchain_core));
+    }
+    if (is_wine() && !s_create_composition_hook.installed()) {
+        s_create_composition_hook.install(&s_factory_vtable[24], reinterpret_cast<void*>(&D3D12Hook::create_swapchain_composition));
     }
 }
 
 HRESULT WINAPI D3D12Hook::create_swapchain_legacy(IDXGIFactory* factory, IUnknown* device,
     DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** swapchain) {
-    const auto hr = s_create_legacy_hook->get_original<decltype(create_swapchain_legacy)*>()(factory, device, desc, swapchain);
+    const auto hr = s_create_legacy_hook.get_original<decltype(create_swapchain_legacy)*>()(factory, device, desc, swapchain);
     if (SUCCEEDED(hr) && swapchain != nullptr) capture_queue(device, *swapchain, "CreateSwapChain");
     return hr;
 }
 
 HRESULT WINAPI D3D12Hook::create_swapchain_core(IDXGIFactory2* factory, IUnknown* device, IUnknown* window,
     const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* output, IDXGISwapChain1** swapchain) {
-    const auto hr = s_create_core_hook->get_original<decltype(create_swapchain_core)*>()(factory, device, window, desc, output, swapchain);
+    const auto hr = s_create_core_hook.get_original<decltype(create_swapchain_core)*>()(factory, device, window, desc, output, swapchain);
     if (SUCCEEDED(hr) && swapchain != nullptr) capture_queue(device, *swapchain, "CreateSwapChainForCoreWindow");
     return hr;
 }
 
 HRESULT WINAPI D3D12Hook::create_swapchain_composition(IDXGIFactory2* factory, IUnknown* device,
     const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* output, IDXGISwapChain1** swapchain) {
-    const auto hr = s_create_composition_hook->get_original<decltype(create_swapchain_composition)*>()(factory, device, desc, output, swapchain);
+    const auto hr = s_create_composition_hook.get_original<decltype(create_swapchain_composition)*>()(factory, device, desc, output, swapchain);
     if (SUCCEEDED(hr) && swapchain != nullptr) capture_queue(device, *swapchain, "CreateSwapChainForComposition");
     return hr;
 }
@@ -159,7 +168,7 @@ void* D3D12Hook::Streamline::link_swapchain_to_cmd_queue(void* rcx, void* rdx, v
 }
 
 HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* p_fullscreen_desc, IDXGIOutput* p_restrict_to_output, IDXGISwapChain1** swap_chain) {
-    auto create_swap_chain_fn = s_create_swapchain_hook->get_original<decltype(D3D12Hook::create_swapchain)*>();
+    auto create_swap_chain_fn = s_create_swapchain_hook.get_original<decltype(D3D12Hook::create_swapchain)*>();
 
     if (is_wine()) {
         const auto hr = create_swap_chain_fn(factory, device, hwnd, desc, p_fullscreen_desc, p_restrict_to_output, swap_chain);
